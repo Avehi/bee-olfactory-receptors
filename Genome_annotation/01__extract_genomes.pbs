@@ -1,0 +1,41 @@
+#!/bin/bash
+
+#settings
+WORK_DIR=$SCRATCH/sensory_annotation
+DB=$WORK_DIR/db/genomes.db
+HAL=/gpfs/group/mml64/default/share/hal/Eucerines_16DEC21.hal
+CACTUS_IMG=/gpfs/group/mml64/default/share/singularity/cactus-v1.2.3.img 
+#/settings
+
+#hal-->fasta
+cp $HAL hal/alignment.hal
+mkdir -p $WORK_DIR/fna
+echo "
+cd $WORK_DIR
+halStats hal/alignment.hal | grep \"(\" >hal/alignment.hal.tree
+halStats hal/alignment.hal | awk 'BEGIN{FS=\",\"} NR>5 && !(\$1~/clade/) && !(\$1~/Anc/) && !(\$1==\"\") {print \$1}' | while read SPP; do
+  echo Extracting \$SPP
+  hal2fasta hal/alignment.hal \$SPP >fna/\$SPP.fna
+done
+" >$WORK_DIR/fna/extract_fna.sh
+singularity exec $CACTUS_IMG /bin/sh $WORK_DIR/fna/extract_fna.sh
+
+#fasta-->database
+module load braker2
+mkdir -p $WORK_DIR/db
+for f in $WORK_DIR/fna/*.fna; do echo -ne "$(basename $f .fna)\t$f\n"; done >$WORK_DIR/db/genomes.tbl
+while read line
+do
+  species=$(echo "$line" | cut -f 1)
+  genome=$(echo "$line" | cut -f 2)
+  load2sqlitedb --noIdx --species=$species --dbaccess=$DB $genome
+done <$WORK_DIR/db/genomes.tbl
+load2sqlitedb --makeIdx --dbaccess=$DB
+sqlite3 -header -column $DB "\
+ SELECT speciesname, \
+  sum(end-start+1) AS 'genome length',\
+  count(*) AS '# chunks',\
+  count(distinct seqnr) AS '# seqs'\
+ FROM genomes natural join speciesnames\
+ GROUP BY speciesname;"
+

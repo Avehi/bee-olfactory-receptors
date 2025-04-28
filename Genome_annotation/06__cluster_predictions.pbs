@@ -1,0 +1,97 @@
+#!/bin/bash
+#PBS -l nodes=1:ppn=24:rhel7 #how many compute nodes; how many cores/node; what type of node
+#PBS -l walltime=4:00:00     #how long to run; HH:MM:SS
+#PBS -l pmem=4gb             #memory per core
+#PBS -A open                 #what allocation to use
+#PBS -N annot_orf 	     #job name 
+#PBS -j oe                   #print stdin/stderr to same file
+
+cd $PBS_O_WORKDIR
+export OMP_NUM_THREADS=23
+
+#settings
+TREEFILE=hal/alignment.hal.tree
+#/settings
+
+#mkdir -p orthofinder && cd orthofinder && wget https://github.com/davidemms/OrthoFinder/releases/download/2.5.4/OrthoFinder_source.tar.gz && tar xzvf *tar.gz && cd ..
+
+#-----------classify into OR, GR, IR
+module purge
+module load braker2
+RECIPROCAL_THRESHOLD=40
+mkdir -p orf
+for i in pred/*primary.aa; do
+  SPP=`basename $i .primary.aa`
+  sed 's/\*/X/g' $i | bioawk -cfastx -vs=$SPP '{print ">"s"__"$name"\n"$seq}' >orf/${SPP}.faa
+done
+for i in OR IR GR; do
+  diamond makedb --in prt/$i.fasta --db prt/$i.fasta
+done
+
+rm -rf orf/OR* orf/GR* orf/IR*
+for i in orf/*.faa; do
+  SPP=`basename $i .faa`
+  for j in OR IR GR; do
+    mkdir -p orf/$j
+    diamond blastp --query $i --db prt/$j.fasta --subject-cover $RECIPROCAL_THRESHOLD --query-cover $RECIPROCAL_THRESHOLD -k 1 -p ${OMP_NUM_THREADS} -o $i.$j.blastp
+    grep -A1 --no-group-separator -f <(cut -f1 $i.$j.blastp) $i >>orf/$j.aa
+    grep -A1 --no-group-separator -f <(cut -f1 $i.$j.blastp) $i | \
+      bioawk -cfastx 'length($seq) >= 200 {print ">"$name"\n"$seq}' >orf/$j/$SPP.fa
+    #grep -A1 --no-group-separator -f <(cut -f1 $i.$j.blastp) $i >orf/$j/$SPP.fa
+  done
+done
+
+##cluster using orthofinder
+module purge
+module load relernn
+
+cp $TREEFILE orf/tree
+sed -i 's/^/(/' orf/tree
+sed -i 's/;$/:1.0,Drosophila_melanogaster:1.0)root;/' orf/tree
+for j in OR IR GR; do
+  cp dmel/*.$j.fasta orf/$j/Drosophila_melanogaster.fa
+  orthofinder/OrthoFinder_source/orthofinder.py -s orf/tree -f ./orf/$j &>orf/orthofinder.$j.log
+  mv orf/$j/OrthoFinder/Results* orf/$j/orthofinder && rm -r orf/$j/OrthoFinder
+done
+
+#-------------DEPR
+##remove orthogroups without sensory genes
+#if [ ! -d orf/orthogroups ]; then
+#  find orf/OrthoFinder -name "Orthogroup_Sequences" -exec cp -r {} orf/orthogroups \;
+#fi
+#
+#echo $'
+##!/bin/bash
+#set -e
+#module load gcc/8.3.1
+#module load mafft
+#FILE=$1
+#TOTAL=$2
+#ORS=$3
+#IRS=$4
+#GRS=$5
+#COL_GAP=0.1
+#RES_OVERLAP=0.5
+#SEQ_OVERLAP=80
+#TYPE=`echo "cat(c(\'OR\',\'GR\',\'IR\')[which.max(c($ORS,$IRS,$GRS))])" | R --slave`
+#if [ $((ORS + IRS + GRS)) -ge 2 ]; then
+#  #mafft --localpair --maxiterate 1000 $FILE >${FILE//.fa/.aln}
+#  trimal -in ${FILE//.fa/.aln} -gt $COL_GAP >${FILE//.fa/.tmp}
+#  trimal -resoverlap $RES_OVERLAP -seqoverlap $SEQ_OVERLAP -in ${FILE//.fa/.tmp} | bioawk -cfastx \'{print ">"$name"\\n"$seq}\' >"${FILE//.fa}.$TYPE"
+#  rm ${FILE//.fa/.tmp}
+#elif [ $((ORS + IRS + GRS)) == 1 ]; then
+#  bioawk -cfastx \'{print ">"$name"\\n"$seq}\' $FILE >"${FILE//.fa}.$TYPE"
+#else
+#  rm $FILE
+#fi
+#' >cluster_predictions.sh
+#while read FILE TOTAL ORS IRS GRS; do
+#  echo "bash cluster_predictions.sh $FILE $TOTAL $ORS $IRS $GRS"
+#done<orf/orthogroups/stats >orf/orthogroups/aln.jobfile
+#module purge
+#module load gcc/8.3.1
+#module load parallel
+#parallel -j ${OMP_NUM_THREADS} <orf/orthogroups/aln.jobfile
+
+echo "Finished at `date`"
+

@@ -1,0 +1,55 @@
+#!/bin/bash
+#PBS -l nodes=1:ppn=24:rhel7 #how many compute nodes; how many cores/node; what type of node
+#PBS -l walltime=48:00:00    #how long to run; HH:MM:SS
+#PBS -l pmem=4gb             #memory per core
+#PBS -A open                 #what allocation to use
+#PBS -N annot_align 	     #job name 
+#PBS -j oe                   #print stdin/stderr to same file
+
+cd $PBS_O_WORKDIR
+export OMP_NUM_THREADS=24
+
+#settings
+INPUT_DIR=/gpfs/scratch/nsp5229/sensory_annotation/align
+WORK_DIR=/gpfs/scratch/nsp5229/sensory_annotation/align
+TREE_FILE=/gpfs/group/mml64/default/share/hal/Apoidea_updated.tree
+OUTPUT_PREFIX=/gpfs/scratch/nsp5229/sensory_annotation/align/Eucerines_16DEC21.hal
+ROOT=Anc47
+CACTUS_IMG=/gpfs/group/mml64/default/share/singularity/cactus-v1.2.3.img
+#/settings
+
+mkdir -p $WORK_DIR
+
+module purge
+module load gcc/8.3.1
+module load parallel
+
+#for i in $INPUT_DIR/*.fna; do
+#  SPECIES=`basename $i`
+#  SPECIES=${SPECIES//.fna}
+#  mkdir -p ${WORK_DIR}/${SPECIES}.mask/output
+#  cp $i ${WORK_DIR}/${SPECIES}.mask/genome.fa
+#  echo "red/Red -gnm ${WORK_DIR}/${SPECIES}.mask -msk ${WORK_DIR}/${SPECIES}.mask/output -rpt ${WORK_DIR}/${SPECIES}.mask/output -frm 2 &>${WORK_DIR}/${SPECIES}.mask/logfile"
+#  mv ${WORK_DIR}/${SPECIES}.mask/output/genome.msk $i
+#done>${WORK_DIR}/jobfile.mask
+#parallel --jobs ${OMP_NUM_THREADS} <${WORK_DIR}/jobfile.mask
+#rm -r ${WORK_DIR}/*.mask
+
+module purge
+
+cat $TREE_FILE >$WORK_DIR/cactus_config.txt
+for i in $WORK_DIR/*.fna; do
+  SPECIES=`basename $i`
+  SPECIES=${SPECIES//.fna}
+  echo "$SPECIES $i"
+done>>$WORK_DIR/cactus_config.txt
+
+echo "
+mkdir -p $WORK_DIR/cactus_work
+cactus $WORK_DIR/cactus_jobstore $WORK_DIR/cactus_config.txt ${OUTPUT_PREFIX} --workDir $WORK_DIR/cactus_work --root ${ROOT} --maxCores ${OMP_NUM_THREADS} 
+halStats ${OUTPUT_PREFIX} > ${OUTPUT_PREFIX}.stats
+" > $WORK_DIR/run_cactus.sh
+singularity exec $CACTUS_IMG /bin/sh $WORK_DIR/run_cactus.sh &>$WORK_DIR/run_cactus.log
+
+echo "Finished at `date`"
+

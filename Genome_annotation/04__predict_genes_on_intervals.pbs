@@ -1,0 +1,99 @@
+#!/bin/bash
+#PBS -l nodes=1:ppn=24:rhel7 #how many compute nodes; how many cores/node; what type of node
+#PBS -l walltime=48:00:00    #how long to run; HH:MM:SS
+#PBS -l pmem=4gb             #memory per core
+#PBS -A open                 #what allocation to use
+#PBS -N annot_cgp 	     #job name 
+#PBS -j oe                   #print stdin/stderr to same file
+
+cd $PBS_O_WORKDIR
+export OMP_NUM_THREADS=23
+
+IMGFILE=$GROUP/share/singularity/catk-develop.img
+
+#run augustus cgp
+echo $'
+#!/bin/bash
+
+set -e
+
+echo "`date`"
+
+WORKDIR=$1
+DB=$2
+CFG=$3
+
+#"exactlyone" requires a complete gene which might not be possible :-|
+#could also use --alternatives-from-sampling to try to get a bunch of possible transcripts for debugging purposes
+
+if [ -s ${WORKDIR}/maf ]; then
+grep "# hal" ${WORKDIR}/maf | sed \'s/# hal //\' >${WORKDIR}/tree
+augustus --species=honeybee1 --softmasking=1 --treefile=${WORKDIR}/tree --alnfile=${WORKDIR}/maf --dbaccess=$DB \
+  --allow_hinted_splicesites=atac --extrinsicCfgFile=$CFG --dbhints=1 \
+  --uniqueGeneId=true \
+  --speciesfilenames=db/genomes.tbl --alternatives-from-evidence=0 --/CompPred/outdir=${WORKDIR}/cgp
+fi
+
+echo "---FINISHED---"
+' >predict_genes_on_intervals.sh
+
+#set up hints and configuration file
+module purge
+module load braker2
+DB=maf/cgp.db
+CFG=maf/cgp.cfg
+mkdir -p maf
+if [ ! -f $DB ]; then
+  SPECIES=""
+  cp db/genomes.db $DB
+  mkdir -p maf/hints
+  for INTERVALS in mte/*.bed; do
+    SPP=`basename $INTERVALS .bed`
+    mkdir -p maf/${SPP}
+    find maf/${SPP} -name "hints" -exec cat {} \; >maf/hints/${SPP}.hints.gtf
+    load2sqlitedb --species=${SPP} --dbaccess=$DB maf/hints/${SPP}.hints.gtf
+    SPECIES="$SPECIES $SPP"
+  done
+  sqlite3 -header -column $DB "SELECT count(*) AS '#hints',typename,speciesname FROM (hints as H join featuretypes as F on H.type=F.typeid) natural join speciesnames group by speciesid,typename;" >maf/hints/summary
+  awk -vi="$SPECIES" '/src=XNT/ {print;print i;getline;getline}1' cfg/extrinsic-cgp.XNT.cfg >$CFG
+fi
+
+#set up jobs and run
+module purge
+module load gcc/8.3.1
+module load parallel
+##reset NOT WORKING
+echo $'
+#!/bin/bash
+for JOBFILE in maf/*.jobfile.cgp; do
+  if [ -f $JOBFILE.failed ]; then
+    #grep --no-group-separator -f $JOBFILE.failed $JOBFILE >$JOBFILE.tmp && mv $JOBFILE.tmp $JOBFILE
+    while read LOGFILE; do
+      rm -f ${LOGFILE}
+    done<$JOBFILE.failed
+  fi
+done
+rm -f maf/*cgp.lock
+rm -f maf/*cgp.failed
+' > maf/reset.cgp && chmod +x maf/reset.cgp
+for INTERVALS in mte/*.bed; do
+  SPP=`basename $INTERVALS .bed`
+  if [ ! -f maf/$SPP.jobfile.cgp.lock ]; then
+    while read CONTIG LOWER UPPER; do
+      CHUNK="$CONTIG"__"$LOWER"__"$UPPER"
+      if [ ! -f maf/${SPP}/${CHUNK}.cgp.log ]; then 
+        echo "singularity exec $IMGFILE /bin/bash predict_genes_on_intervals.sh maf/${SPP}/${CHUNK} ${DB} ${CFG} &>maf/${SPP}/${CHUNK}.cgp.log"
+      fi
+    done<$INTERVALS>maf/$SPP.jobfile.cgp
+  fi
+done
+for JOBFILE in maf/*.jobfile.cgp; do
+  if [ ! -f $JOBFILE.lock ]; then
+    touch $JOBFILE.lock
+    parallel -j $OMP_NUM_THREADS <$JOBFILE
+    awk 'ENDFILE{print FILENAME"\t"$0}' ${JOBFILE//.jobfile.cgp}/*.cgp.log | awk '!($2 ~ /FINISHED/){print $1}' >$JOBFILE.failed
+  fi
+done
+
+echo "Finished at `date`"
+

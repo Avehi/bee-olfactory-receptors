@@ -1,0 +1,56 @@
+#!/bin/bash
+#PBS -l nodes=1:ppn=24:rhel7 #how many compute nodes; how many cores/node; what type of node
+#PBS -l walltime=4:00:00     #how long to run; HH:MM:SS
+#PBS -l pmem=4gb             #memory per core
+#PBS -A open                 #what allocation to use
+#PBS -N annot_cmb 	     #job name 
+#PBS -j oe                   #print stdin/stderr to same file
+
+cd $PBS_O_WORKDIR
+export OMP_NUM_THREADS=23
+
+IMGFILE=$GROUP/share/singularity/catk-develop.img
+
+mkdir -p pred
+for INTERVALS in mte/*.bed; do
+  SPP=`basename $INTERVALS .bed`
+  ls maf/*/*/cgp/$SPP.cgp.gff >pred/$SPP.list &
+done
+wait
+
+echo $'#!/bin/bash
+set -e
+
+SPP=$1
+
+##filtering criterion (for first pass):
+#-no single exon (-U)
+#-must be complete (-J)
+
+grep "/$SPP/" pred/$SPP.list >pred/$SPP.list.primary
+
+joingenes -f pred/$SPP.list.primary -j -o pred/$SPP.primary.gtf
+fix_joingenes_gtf.pl < pred/$SPP.primary.gtf >pred/$SPP.primary.fixed.gtf
+gtf2gff.pl --gff3 --includeStopInCDS <pred/$SPP.primary.fixed.gtf --out=pred/$SPP.primary.gff3
+gffread -g fna/$SPP.fna -x pred/$SPP.primary.cds -y pred/$SPP.primary.aa -S -J -U pred/$SPP.primary.gff3
+
+##this make be useful in a second pass to detect pseudogenes: combine secondary predictions
+#joingenes -f pred/$SPP.list -j -o pred/$SPP.gtf
+#fix_joingenes_gtf.pl < pred/$SPP.gtf >pred/$SPP.fixed.gtf
+#gtf2gff.pl --gff3 --includeStopInCDS <pred/$SPP.fixed.gtf --out=pred/$SPP.gff3
+#gffread -g fna/$SPP.fna -x pred/$SPP.cds -y pred/$SPP.aa -S pred/$SPP.gff3
+
+rm pred/$SPP*gtf
+' >combine_predictions.sh
+
+module purge
+module load gcc/8.3.1
+module load parallel
+for i in pred/*.list; do
+  SPP=`basename $i .list`
+  echo "module load braker2 && bash combine_predictions.sh $SPP &>pred/$SPP.combine.log"
+done>pred/jobfile.combine
+parallel -j ${OMP_NUM_THREADS} <pred/jobfile.combine
+
+echo "Finished at `date`"
+

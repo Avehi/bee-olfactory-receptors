@@ -1,0 +1,115 @@
+#!/bin/bash
+#PBS -l nodes=1:ppn=24:rhel7 #how many compute nodes; how many cores/node; what type of node
+#PBS -l walltime=24:00:00    #how long to run; HH:MM:SS
+#PBS -l pmem=4gb             #memory per core
+#PBS -A open                 #what allocation to use
+#PBS -N annot_maf 	     #job name 
+#PBS -j oe                   #print stdin/stderr to same file
+
+cd $PBS_O_WORKDIR
+export OMP_NUM_THREADS=4
+
+#settings
+IMGFILE=$GROUP/share/singularity/catk-develop.img
+PROTFILE=prt/sensory_genes.fasta
+#/settings
+
+#get hints per maf chunk
+echo $'
+#!/bin/bash
+
+set -e
+
+PARAM_MAXHIT=5000
+
+#-------generate hints for augustus cgp for a given chunk
+#-------using output of find_candidate_intervals.sh
+#-------run using catk singularity container
+
+#using BED-style coordinates
+SPECIES=${1}
+CONTIG=${2}
+LOWER=${3}
+UPPER=${4}
+PROTEIN_QUERY=${5}
+HAL=${6}
+
+#pull out chunk as maf and as reference fasta
+#not using ancestral sequences right now in an effort to speed things up
+CHUNK=${CONTIG}__${LOWER}__${UPPER}
+mkdir -p maf/${SPECIES}/${CHUNK}
+hal2maf --refGenome ${SPECIES} --refSequence ${CONTIG} --noAncestors --start $LOWER --length $((UPPER - LOWER)) \
+  ${HAL} maf/${SPECIES}/${CHUNK}/maf
+hal2fasta --sequence ${CONTIG} --start $LOWER --length $((UPPER - LOWER)) \
+  ${HAL} ${SPECIES} >maf/${SPECIES}/${CHUNK}/fna
+
+#prescreen with mmseqs2
+#use top hits to reduce work for exonerate
+util/mmseqs/bin/mmseqs easy-search --threads 1 --sort-results 1 --max-seqs $PARAM_MAXHIT \
+   maf/${SPECIES}/${CHUNK}/fna ${PROTEIN_QUERY} maf/${SPECIES}/${CHUNK}/m8 maf/${SPECIES}/${CHUNK}/tmp
+rm -rf maf/${SPECIES}/${CHUNK}/tmp
+awk \'{if(!($2 in _)) _[$2]=$12}END{for(i in _) print i"\t"_[i]}\' maf/${SPECIES}/${CHUNK}/m8 | \
+  sort -k2,2nr | head -${PARAM_MAXHIT} | cut -f1 >maf/${SPECIES}/${CHUNK}/hits
+
+if [ -s maf/${SPECIES}/${CHUNK}/hits ]; then
+
+grep --no-group-separator -A1 -f maf/${SPECIES}/${CHUNK}/hits ${PROTEIN_QUERY} >maf/${SPECIES}/${CHUNK}/faa
+
+#get gff via exonerate
+exonerate --model protein2genome --showvulgar no --showalignment no --showtargetgff yes \
+   maf/${SPECIES}/${CHUNK}/faa maf/${SPECIES}/${CHUNK}/fna >maf/${SPECIES}/${CHUNK}/gtf
+
+#fix coordinates
+awk -voffset=$LOWER \'BEGIN{FS="\t"; OFS="\t"} NR>2 && !($0 ~ /^#/) {$4=$4+offset; $5=$5+offset; print $0}\' maf/${SPECIES}/${CHUNK}/gtf >maf/${SPECIES}/${CHUNK}/gtf.tmp
+
+#convert to hints
+exonerate2hints.pl --in=maf/${SPECIES}/${CHUNK}/gtf.tmp --source=XNT --CDSpart_cutoff=0 --out=maf/${SPECIES}/${CHUNK}/hints
+sort -n -k 4,4 maf/${SPECIES}/${CHUNK}/hints | sort -s -n -k 5,5 | sort -s -n -k 3,3 | sort -s -k 1,1 | join_mult_hints.pl >maf/${SPECIES}/${CHUNK}/gtf.tmp
+mv maf/${SPECIES}/${CHUNK}/gtf.tmp maf/${SPECIES}/${CHUNK}/hints
+
+else
+echo "No hits"
+fi
+
+echo "---FINISHED---"
+' >extract_hints_from_hal.sh
+
+#get static binary of mmseqs
+mkdir -p util
+if [ ! -d util/mmseqs ]; then
+  cd util
+  wget https://mmseqs.com/latest/mmseqs-linux-avx2.tar.gz
+  tar xvfz mmseqs-linux-avx2.tar.gz
+  cd ..
+fi
+
+#set up jobs
+module purge
+module load gcc/8.3.1
+module load parallel
+mkdir -p maf
+if [ ! -f maf/prot.aa ]; then
+  bioawk -cfastx '{print ">"$name"\t"$comment"\n"toupper($seq)}' $PROTFILE >maf/prot.aa
+fi
+for INTERVALS in mte/*.bed; do
+  SPP=`basename $INTERVALS .bed`
+  mkdir -p maf/${SPP}
+  if [ ! -f maf/$SPP.jobfile.maf.lock ]; then
+    while read CONTIG LOWER UPPER; do
+      CHUNK="$CONTIG"__"$LOWER"__"$UPPER"
+      if [ ! -f maf/${SPP}/${CHUNK}.maf.log ]; then 
+        echo "module load metaeuk && singularity exec $IMGFILE /bin/bash extract_hints_from_hal.sh $SPP $CONTIG $LOWER $UPPER maf/prot.aa hal/alignment.hal &>maf/${SPP}/${CHUNK}.maf.log"
+      fi
+    done<$INTERVALS>maf/$SPP.jobfile.maf
+  fi
+done
+for JOBFILE in maf/*.jobfile.maf; do
+  if [ ! -f $JOBFILE.lock ]; then
+    touch $JOBFILE.lock
+    parallel -j $OMP_NUM_THREADS <$JOBFILE
+    awk 'ENDFILE{print FILENAME"\t"$0}' ${JOBFILE//.jobfile.maf}/*.maf.log | awk '!($2 ~ /FINISHED/){print $1}' >$JOBFILE.failed
+  fi
+done
+
+echo "Finished at `date`"
+
